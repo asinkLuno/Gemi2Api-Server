@@ -7,6 +7,7 @@ import re
 import tempfile
 import time
 import uuid
+from collections import OrderedDict
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Union
 
@@ -42,6 +43,10 @@ SECURE_1PSID = os.environ.get("SECURE_1PSID", "")
 SECURE_1PSIDTS = os.environ.get("SECURE_1PSIDTS", "")
 API_KEY = os.environ.get("API_KEY", "")
 ENABLE_THINKING = os.environ.get("ENABLE_THINKING", "false").lower() == "true"
+MAX_CONVERSATION_CACHE = int(os.environ.get("MAX_CONVERSATION_CACHE", "10"))
+
+# Conversation cache using LRU strategy
+conversation_cache: OrderedDict[str, dict] = OrderedDict()
 
 # Print debug info at startup
 if not SECURE_1PSID or not SECURE_1PSIDTS:
@@ -239,60 +244,120 @@ def map_model_name(openai_model_name: str) -> Model:
 	return next(iter(Model))
 
 
-# Prepare conversation history from OpenAI messages format
-def prepare_conversation(messages: List[Message]) -> tuple:
-	conversation = ""
-	temp_files = []
-	system_prompt = None
+# Conversation management functions
+def get_conversation_key(request: ChatCompletionRequest) -> str:
+	"""Generate a unique key for conversation based on request parameters"""
+	# Use conversation_id if provided, otherwise use a combination of model and first user message
+	if hasattr(request, 'conversation_id') and request.conversation_id:
+		return str(request.conversation_id)
 
-	for msg in messages:
-		if isinstance(msg.content, str):
-			# String content handling
-			if msg.role == "system":
-				# Extract system prompt for gem creation
-				system_prompt = msg.content
-			elif msg.role == "user":
-				conversation += f"Human: {msg.content}\n\n"
-			elif msg.role == "assistant":
-				conversation += f"Assistant: {msg.content}\n\n"
-		else:
-			# Mixed content handling
-			if msg.role == "user":
-				conversation += "Human: "
-			elif msg.role == "system":
-				# Extract system prompt from mixed content
+	# Create a hash based on model and the first user message only
+	# This ensures that subsequent requests with the same conversation history get the same key
+	key_parts = [request.model]
+
+	# Find the first user message
+	for msg in request.messages:
+		if msg.role == "user":
+			if isinstance(msg.content, str):
+				key_parts.append(msg.content[:50])  # Use first 50 chars
+				break
+			else:
 				for item in msg.content:
 					if item.type == "text":
-						system_prompt = item.text
-			elif msg.role == "assistant":
-				conversation += "Assistant: "
+						key_parts.append(item.text[:50])
+						break
+
+	return "|".join(key_parts)
+
+
+def get_or_create_conversation(request: ChatCompletionRequest) -> tuple:
+	"""Get existing conversation from cache or create new one"""
+	global conversation_cache
+
+	conversation_key = get_conversation_key(request)
+
+	# Check if conversation exists in cache
+	if conversation_key in conversation_cache:
+		# Move to end (LRU)
+		conversation_cache.move_to_end(conversation_key)
+		cached_data = conversation_cache[conversation_key]
+		logger.info(f"Retrieved existing conversation: {conversation_key}")
+		return cached_data['metadata'], cached_data['system_prompt'], None
+
+	# New conversation
+	logger.info(f"Creating new conversation: {conversation_key}")
+	return None, None, conversation_key
+
+
+def cache_conversation(conversation_key: str, metadata: dict, system_prompt: str):
+	"""Cache conversation metadata for future use"""
+	global conversation_cache, MAX_CONVERSATION_CACHE
+
+	# Add to cache
+	conversation_cache[conversation_key] = {
+		'metadata': metadata,
+		'system_prompt': system_prompt,
+		'timestamp': datetime.now(timezone.utc)
+	}
+
+	# Move to end (most recently used)
+	conversation_cache.move_to_end(conversation_key)
+
+	# Remove oldest if cache is full
+	while len(conversation_cache) > MAX_CONVERSATION_CACHE:
+		oldest_key = next(iter(conversation_cache))
+		logger.info(f"Evicting oldest conversation from cache: {oldest_key}")
+		del conversation_cache[oldest_key]
+
+
+def extract_system_prompt(messages: List[Message]) -> Optional[str]:
+	"""Extract system prompt from messages"""
+	for msg in messages:
+		if msg.role == "system":
+			if isinstance(msg.content, str):
+				return msg.content
+			else:
+				for item in msg.content:
+					if item.type == "text":
+						return item.text
+	return None
+
+
+async def process_images_in_messages(messages: List[Message]) -> tuple:
+	"""Process base64 images in messages and return temp file paths"""
+	temp_files = []
+	processed_messages = []
+
+	for msg in messages:
+		if msg.role == "system":
+			continue  # Skip system messages for content processing
+
+		if isinstance(msg.content, str):
+			processed_messages.append((msg.role, msg.content, None))
+		else:
+			image_files = []
+			text_content = []
 
 			for item in msg.content:
 				if item.type == "text":
-					conversation += item.text or ""
+					text_content.append(item.text)
 				elif item.type == "image_url" and item.image_url:
-					# Handle image
 					image_url = item.image_url.get("url", "")
 					if image_url.startswith("data:image/"):
-						# Process base64 encoded image
 						try:
-							# Extract the base64 part
 							base64_data = image_url.split(",")[1]
 							image_data = base64.b64decode(base64_data)
 
-							# Create temporary file to hold the image
 							with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
 								tmp.write(image_data)
 								temp_files.append(tmp.name)
+								image_files.append(tmp.name)
 						except Exception as e:
 							logger.error(f"Error processing base64 image: {str(e)}")
 
-			conversation += "\n\n"
+			processed_messages.append((msg.role, " ".join(text_content), image_files))
 
-	# Add a final prompt for the assistant to respond to
-	conversation += "Assistant: "
-
-	return conversation, temp_files, system_prompt
+	return processed_messages, temp_files
 
 
 # Helper to create gem from system prompt
@@ -339,17 +404,14 @@ async def create_chat_completion(request: ChatCompletionRequest, api_key: str = 
 			await gemini_client.init(timeout=300)
 			logger.info("Gemini client initialized successfully")
 
-		# 使用当前请求的消息
-		messages_to_use = request.messages
+		# 获取或创建对话
+		metadata, cached_system_prompt, conversation_key = get_or_create_conversation(request)
 
-		# 转换消息为对话格式，提取系统提示词
-		conversation, temp_files, system_prompt = prepare_conversation(messages_to_use)
-		logger.info(f"Prepared conversation: {conversation}")
-		logger.info(f"Temp files: {temp_files}")
-		logger.info(f"System prompt from messages: {system_prompt}")
+		# 提取系统提示词
+		extracted_system_prompt = extract_system_prompt(request.messages)
 
 		# 使用请求中的 system_prompt 字段（优先级高于消息中的系统提示词）
-		final_system_prompt = request.system_prompt if request.system_prompt else system_prompt
+		final_system_prompt = request.system_prompt if request.system_prompt else (cached_system_prompt or extracted_system_prompt)
 		logger.info(f"Final system prompt: {final_system_prompt}")
 
 		# 获取适当的模型
@@ -363,14 +425,58 @@ async def create_chat_completion(request: ChatCompletionRequest, api_key: str = 
 			if gem_obj:
 				logger.info(f"Created gem from system prompt: {gem_obj.id}")
 
+		# 处理消息和图片
+		processed_messages, temp_files = await process_images_in_messages(request.messages)
+
 		# 生成响应
 		logger.info("Sending request to Gemini...")
-		if temp_files:
-			# With files
-			response = await gemini_client.generate_content(conversation, files=temp_files, model=model, gem=gem_obj)
+		if metadata:
+			# 恢复之前的对话
+			logger.info(f"Restoring previous conversation: {conversation_key}")
+			chat = gemini_client.start_chat(metadata=metadata)
 		else:
-			# Text only
-			response = await gemini_client.generate_content(conversation, model=model, gem=gem_obj)
+			# 开始新对话
+			logger.info(f"Starting new conversation: {conversation_key}")
+			chat = gemini_client.start_chat(gem=gem_obj)
+
+		# 如果是恢复的对话，发送完整的历史消息
+		if metadata and len(processed_messages) > 1:
+			logger.info("Sending conversation history to Gemini...")
+			# 发送历史消息（除了最后一条）
+			for i, (role, content, image_files) in enumerate(processed_messages[:-1]):
+				if role == "user":
+					try:
+						if image_files:
+							await chat.send_message(content, files=image_files)
+						else:
+							await chat.send_message(content)
+					except Exception as e:
+						logger.warning(f"Failed to send historical message {i}: {str(e)}")
+				elif role == "assistant":
+					# 对于助手消息，我们只需要记录，不需要发送
+					pass
+
+		# 获取最新的用户消息
+		if processed_messages:
+			latest_message = processed_messages[-1]  # 获取最后一条消息
+			role, content, image_files = latest_message
+
+			if role == "user":
+				# 发送消息并获取响应
+				if image_files:
+					response = await chat.send_message(content, files=image_files)
+				else:
+					response = await chat.send_message(content)
+			else:
+				# 如果最后一条消息不是用户消息，使用空内容
+				response = await chat.send_message("")
+		else:
+			# 没有消息时发送空内容
+			response = await chat.send_message("")
+
+		# 缓存对话元数据
+		if conversation_key:
+			cache_conversation(conversation_key, chat.metadata, final_system_prompt)
 
 		# 清理临时文件
 		for temp_file in temp_files:
@@ -450,9 +556,9 @@ async def create_chat_completion(request: ChatCompletionRequest, api_key: str = 
 				"model": request.model,
 				"choices": [{"index": 0, "message": {"role": "assistant", "content": reply_text}, "finish_reason": "stop"}],
 				"usage": {
-					"prompt_tokens": len(conversation.split()),
+					"prompt_tokens": sum(len(str(msg.content).split()) if isinstance(msg.content, str) else sum(len(item.text.split()) for item in msg.content if item.type == "text") for msg in request.messages),
 					"completion_tokens": len(reply_text.split()),
-					"total_tokens": len(conversation.split()) + len(reply_text.split()),
+					"total_tokens": sum(len(str(msg.content).split()) if isinstance(msg.content, str) else sum(len(item.text.split()) for item in msg.content if item.type == "text") for msg in request.messages) + len(reply_text.split()),
 				},
 			}
 
