@@ -9,14 +9,17 @@ dependencies = [
     "browser-cookie3>=0.20.1",
     "fastapi>=0.115.12",
     "gemini-webapi>=1.15.1",
+    "lmdb>=1.4.1",
     "uvicorn[standard]>=0.34.1",
 ]
 [[tool.uv.index]]
-url = "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple"
+url = "https://mirrors.aliyun.com/pypi/simple"
 default = true
 
 [dependency-groups]
 dev = [
+    "autoflake>=2.3.1",
+    "isort>=6.0.1",
     "ruff>=0.11.7",
 ]
 

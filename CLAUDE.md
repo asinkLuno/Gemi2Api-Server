@@ -22,7 +22,7 @@ This is a FastAPI-based server that provides OpenAI-compatible API endpoints for
 - Image processing (base64 encoded images via temporary files)
 - Markdown link correction for Google search results
 - CORS enabled for web clients
-- Docker containerization with uv package manager
+- Docker containerization
 
 ## Coding Conventions
 
@@ -36,10 +36,7 @@ When making changes to this codebase, please adhere to the following principles:
 
 ### Environment Setup
 ```bash
-# Install dependencies with uv (recommended)
-uv sync
-
-# Or with pip
+# Install dependencies with pip
 pip install fastapi uvicorn gemini-webapi
 
 # Set up environment variables (copy from example)
@@ -49,14 +46,18 @@ cp .env.example .env
 
 ### Running the Server
 ```bash
-# Development server with auto-reload
-uvicorn main:app --reload --host 127.0.0.1 --port 8000
+# Start with Docker (recommended)
+docker compose up -d --force-recreate --build
 
-# Production server
-uvicorn main:app --host 0.0.0.0 --port 8000
+# View logs
+docker compose logs
+```
 
-# Using uv
-uv run uvicorn main:app --reload --host 127.0.0.1 --port 8000
+### Testing
+```bash
+# Restart services and run test
+docker compose up -d --force-recreate --build && python test_chat.py
+
 ```
 
 ### Code Quality
@@ -66,19 +67,13 @@ ruff check .
 ruff format .
 ```
 
-### Docker Commands
+### Development Commands (Alternative)
 ```bash
-# Build and run with docker-compose
-docker-compose up -d
+# Development server with auto-reload
+uvicorn main:app --reload --host 127.0.0.1 --port 8000
 
-# View logs
-docker-compose logs
-
-# Rebuild and restart
-docker-compose up -d --build
-
-# Stop services
-docker-compose down
+# Production server
+uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
 ## Configuration

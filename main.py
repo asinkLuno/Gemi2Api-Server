@@ -2,8 +2,10 @@ import asyncio
 import base64
 import json
 import logging
+import lmdb
 import os
 import re
+import hashlib
 import tempfile
 import time
 import uuid
@@ -15,6 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from gemini_webapi import GeminiClient, set_log_level
 from gemini_webapi.constants import Model
+from gemini_webapi.types import Gem
 from pydantic import BaseModel
 
 # Configure logging
@@ -40,7 +43,20 @@ gemini_client = None
 SECURE_1PSID = os.environ.get("SECURE_1PSID", "")
 SECURE_1PSIDTS = os.environ.get("SECURE_1PSIDTS", "")
 API_KEY = os.environ.get("API_KEY", "")
-ENABLE_THINKING = os.environ.get("ENABLE_THINKING", "false").lower() == "true"
+
+# LMDB for gem caching
+GEMS_DB_PATH = "gemini_db"
+if not os.path.exists(GEMS_DB_PATH):
+    os.makedirs(GEMS_DB_PATH)
+gems_env = lmdb.open(GEMS_DB_PATH, map_size=1024 * 1024 * 10)  # 10 MB
+
+# Conversation caching settings
+CONVERSATION_CACHE_SIZE = int(os.environ.get("CONVERSATION_CACHE_SIZE", 100))
+CONVERSATIONS_DB_PATH = "conversations_db"
+if not os.path.exists(CONVERSATIONS_DB_PATH):
+    os.makedirs(CONVERSATIONS_DB_PATH)
+conversations_env = lmdb.open(CONVERSATIONS_DB_PATH, map_size=1024 * 1024 * 100)  # 100 MB
+conversation_keys = []
 
 # Print debug info at startup
 if not SECURE_1PSID or not SECURE_1PSIDTS:
@@ -117,6 +133,7 @@ class ChatCompletionRequest(BaseModel):
 	presence_penalty: Optional[float] = 0
 	frequency_penalty: Optional[float] = 0
 	user: Optional[str] = None
+	system_prompt: Optional[str] = None
 
 
 class Choice(BaseModel):
@@ -210,12 +227,6 @@ def map_model_name(openai_model_name: str) -> Model:
 	all_models = [m.model_name if hasattr(m, "model_name") else str(m) for m in Model]
 	logger.info(f"Available models: {all_models}")
 
-	# 首先尝试直接查找匹配的模型名称
-	for m in Model:
-		model_name = m.model_name if hasattr(m, "model_name") else str(m)
-		if openai_model_name.lower() in model_name.lower():
-			return m
-
 	# 如果找不到匹配项，使用默认映射
 	model_keywords = {
 		"gemini-pro": ["pro", "2.0"],
@@ -226,7 +237,7 @@ def map_model_name(openai_model_name: str) -> Model:
 	}
 
 	# 根据关键词匹配
-	keywords = model_keywords.get(openai_model_name, ["pro"])  # 默认使用pro模型
+	keywords = model_keywords.get(openai_model_name, [openai_model_name])
 
 	for m in Model:
 		model_name = m.model_name if hasattr(m, "model_name") else str(m)
@@ -237,55 +248,54 @@ def map_model_name(openai_model_name: str) -> Model:
 	return next(iter(Model))
 
 
-# Prepare conversation history from OpenAI messages format
-def prepare_conversation(messages: List[Message]) -> tuple:
-	conversation = ""
-	temp_files = []
+def get_text_from_message(message: Message) -> str:
+    if isinstance(message.content, str):
+        return message.content
+    text = ""
+    if isinstance(message.content, list):
+        for item in message.content:
+            if item.type == "text":
+                text += item.text or ""
+    return text
 
-	for msg in messages:
-		if isinstance(msg.content, str):
-			# String content handling
-			if msg.role == "system":
-				conversation += f"System: {msg.content}\n\n"
-			elif msg.role == "user":
-				conversation += f"Human: {msg.content}\n\n"
-			elif msg.role == "assistant":
-				conversation += f"Assistant: {msg.content}\n\n"
-		else:
-			# Mixed content handling
-			if msg.role == "user":
-				conversation += "Human: "
-			elif msg.role == "system":
-				conversation += "System: "
-			elif msg.role == "assistant":
-				conversation += "Assistant: "
+def prepare_files(messages: List[Message]) -> List[str]:
+    temp_files = []
+    for msg in messages:
+        if isinstance(msg.content, list):
+            for item in msg.content:
+                if item.type == "image_url" and item.image_url:
+                    image_url = item.image_url.get("url", "")
+                    if image_url.startswith("data:image/"):
+                        try:
+                            base64_data = image_url.split(",")[1]
+                            image_data = base64.b64decode(base64_data)
+                            with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
+                                tmp.write(image_data)
+                                temp_files.append(tmp.name)
+                        except Exception as e:
+                            logger.error(f"Error processing base64 image: {str(e)}")
+    return temp_files
 
-			for item in msg.content:
-				if item.type == "text":
-					conversation += item.text or ""
-				elif item.type == "image_url" and item.image_url:
-					# Handle image
-					image_url = item.image_url.get("url", "")
-					if image_url.startswith("data:image/"):
-						# Process base64 encoded image
-						try:
-							# Extract the base64 part
-							base64_data = image_url.split(",")[1]
-							image_data = base64.b64decode(base64_data)
 
-							# Create temporary file to hold the image
-							with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
-								tmp.write(image_data)
-								temp_files.append(tmp.name)
-						except Exception as e:
-							logger.error(f"Error processing base64 image: {str(e)}")
+# Helper to create gem from system prompt
+async def create_gem_from_system_prompt(system_prompt: str, client: GeminiClient) -> Optional[Gem]:
+	"""从系统提示词创建临时 Gem"""
+	if not system_prompt:
+		return None
 
-			conversation += "\n\n"
-
-	# Add a final prompt for the assistant to respond to
-	conversation += "Assistant: "
-
-	return conversation, temp_files
+	try:
+		# Create a temporary gem with a unique ID
+		gem_name = f"system-prompt-{uuid.uuid4().hex[:8]}"
+		gem = await client.create_gem(
+			name=gem_name,
+			prompt=system_prompt,
+			description="Temporary gem created from system prompt"
+		)
+		logger.info(f"Created temporary gem from system prompt: {gem.id}")
+		return gem
+	except Exception as e:
+		logger.error(f"Failed to create gem from system prompt: {str(e)}")
+		return None
 
 
 # Dependency to get the initialized Gemini client
@@ -301,124 +311,190 @@ async def get_gemini_client():
 	return gemini_client
 
 
+
+async def handle_conversation_flow(
+    gemini_client: GeminiClient,
+    model: Model,
+    gem_obj: Optional[Gem],
+    messages: List[Message],
+):
+    """处理新的或恢复的对话，并发送消息"""
+    history_messages = [m for m in messages if m.role in ["user", "assistant"]]
+    chat = None
+    response = None
+
+    if len(history_messages) > 1:
+        history_to_check = history_messages[:-1]
+        history_hash = hashlib.sha256(
+            json.dumps([m.model_dump_json() for m in history_to_check]).encode("utf-8")
+        ).hexdigest()
+
+        with conversations_env.begin() as txn:
+            metadata_json = txn.get(history_hash.encode("utf-8"))
+            if metadata_json:
+                metadata = json.loads(metadata_json.decode("utf-8"))
+                chat = gemini_client.start_chat(metadata=metadata)
+                message_to_send = history_messages[-1]
+                files = prepare_files([message_to_send])
+                response = await chat.send_message(
+                    get_text_from_message(message_to_send), files=files
+                )
+                logger.info(f"Resuming conversation from cache with hash: {history_hash}")
+
+    if not chat:
+        chat = gemini_client.start_chat(model=model, gem=gem_obj)
+        logger.info("Starting a new conversation.")
+        for message in history_messages:
+            files = prepare_files([message])
+            response = await chat.send_message(
+                get_text_from_message(message), files=files
+            )
+
+    return chat, response, history_messages
+
 @app.post("/v1/chat/completions")
-async def create_chat_completion(request: ChatCompletionRequest, api_key: str = Depends(verify_api_key)):
-	try:
-		# 确保客户端已初始化
-		global gemini_client
-		if gemini_client is None:
-			gemini_client = GeminiClient(SECURE_1PSID, SECURE_1PSIDTS)
-			await gemini_client.init(timeout=300)
-			logger.info("Gemini client initialized successfully")
+async def create_chat_completion(
+    request: ChatCompletionRequest,
+    gemini_client: GeminiClient = Depends(get_gemini_client),
+    api_key: str = Depends(verify_api_key),
+):
+    try:
+        messages = request.messages
 
-		# 转换消息为对话格式
-		conversation, temp_files = prepare_conversation(request.messages)
-		logger.info(f"Prepared conversation: {conversation}")
-		logger.info(f"Temp files: {temp_files}")
+        # Extract system prompt and handle gem caching
+        system_prompt_msg = next((m for m in messages if m.role == "system"), None)
+        final_system_prompt = request.system_prompt or (
+            get_text_from_message(system_prompt_msg) if system_prompt_msg else None
+        )
 
-		# 获取适当的模型
-		model = map_model_name(request.model)
-		logger.info(f"Using model: {model}")
+        gem_obj = None
+        if final_system_prompt:
+            with gems_env.begin(write=True) as txn:
+                gem_json_bytes = txn.get(final_system_prompt.encode("utf-8"))
+                if gem_json_bytes:
+                    gem_data = json.loads(gem_json_bytes.decode("utf-8"))
+                    gem_obj = Gem(**gem_data)
+                    logger.info(f"Using cached gem with ID: {gem_obj.id}")
+                else:
+                    gem_obj = await create_gem_from_system_prompt(
+                        final_system_prompt, gemini_client
+                    )
+                    if gem_obj:
+                        gem_json = gem_obj.model_dump_json()
+                        txn.put(
+                            final_system_prompt.encode("utf-8"),
+                            gem_json.encode("utf-8"),
+                        )
+                        logger.info(f"Created and cached new gem with ID: {gem_obj.id}")
 
-		# 生成响应
-		logger.info("Sending request to Gemini...")
-		if temp_files:
-			# With files
-			response = await gemini_client.generate_content(conversation, files=temp_files, model=model)
-		else:
-			# Text only
-			response = await gemini_client.generate_content(conversation, model=model)
+        model = map_model_name(request.model)
+        chat, response, history_messages = await handle_conversation_flow(
+            gemini_client, model, gem_obj, messages
+        )
 
-		# 清理临时文件
-		for temp_file in temp_files:
-			try:
-				os.unlink(temp_file)
-			except Exception as e:
-				logger.warning(f"Failed to delete temp file {temp_file}: {str(e)}")
+        reply_text = response.text if response else ""
+        reply_text = correct_markdown(reply_text)
 
-		# 提取文本响应
-		reply_text = ""
-		# 提取思考内容
-		if ENABLE_THINKING and hasattr(response, "thoughts"):
-			reply_text += f"<think>{response.thoughts}</think>"
-		if hasattr(response, "text"):
-			reply_text += response.text
-		else:
-			reply_text += str(response)
-		reply_text = reply_text.replace("&lt;", "<").replace("\\<", "<").replace("\\_", "_").replace("\\>", ">")
-		reply_text = correct_markdown(reply_text)
+        with conversations_env.begin(write=True) as txn:
+            new_history = history_messages + [
+                Message(role="assistant", content=reply_text)
+            ]
+            new_history_hash = hashlib.sha256(
+                json.dumps([m.model_dump_json() for m in new_history]).encode("utf-8")
+            ).hexdigest()
 
-		logger.info(f"Response: {reply_text}")
+            metadata_to_store = chat.metadata
+            txn.put(
+                new_history_hash.encode("utf-8"),
+                json.dumps(metadata_to_store).encode("utf-8"),
+            )
 
-		if not reply_text or reply_text.strip() == "":
-			logger.warning("Empty response received from Gemini")
-			reply_text = "服务器返回了空响应。请检查 Gemini API 凭据是否有效。"
+            if new_history_hash not in conversation_keys:
+                conversation_keys.append(new_history_hash)
+                if len(conversation_keys) > CONVERSATION_CACHE_SIZE:
+                    oldest_key = conversation_keys.pop(0)
+                    txn.delete(oldest_key.encode("utf-8"))
+                    logger.info(f"Cache full. Evicted oldest conversation: {oldest_key}")
+            logger.info(f"Stored new conversation state with hash: {new_history_hash}")
 
-		# 创建响应对象
-		completion_id = f"chatcmpl-{uuid.uuid4()}"
-		created_time = int(time.time())
+        completion_id = f"chatcmpl-{uuid.uuid4()}"
+        created_time = int(time.time())
 
-		# 检查客户端是否请求流式响应
-		if request.stream:
-			# 实现流式响应
-			async def generate_stream():
-				# 创建 SSE 格式的流式响应
-				# 先发送开始事件
-				data = {
-					"id": completion_id,
-					"object": "chat.completion.chunk",
-					"created": created_time,
-					"model": request.model,
-					"choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
-				}
-				yield f"data: {json.dumps(data)}\n\n"
+        if request.stream:
 
-				# 模拟流式输出 - 将文本按字符分割发送
-				for char in reply_text:
-					data = {
-						"id": completion_id,
-						"object": "chat.completion.chunk",
-						"created": created_time,
-						"model": request.model,
-						"choices": [{"index": 0, "delta": {"content": char}, "finish_reason": None}],
-					}
-					yield f"data: {json.dumps(data)}\n\n"
-					# 可选：添加短暂延迟以模拟真实的流式输出
-					await asyncio.sleep(0.01)
+            async def generate_stream():
+                data = {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created_time,
+                    "model": request.model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"role": "assistant"},
+                            "finish_reason": None,
+                        }
+                    ],
+                }
+                yield f"data: {json.dumps(data)}\n\n"
 
-				# 发送结束事件
-				data = {
-					"id": completion_id,
-					"object": "chat.completion.chunk",
-					"created": created_time,
-					"model": request.model,
-					"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-				}
-				yield f"data: {json.dumps(data)}\n\n"
-				yield "data: [DONE]\n\n"
+                for char in reply_text:
+                    data = {
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created_time,
+                        "model": request.model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"content": char},
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                    yield f"data: {json.dumps(data)}\n\n"
+                    await asyncio.sleep(0.01)
 
-			return StreamingResponse(generate_stream(), media_type="text/event-stream")
-		else:
-			# 非流式响应（原来的逻辑）
-			result = {
-				"id": completion_id,
-				"object": "chat.completion",
-				"created": created_time,
-				"model": request.model,
-				"choices": [{"index": 0, "message": {"role": "assistant", "content": reply_text}, "finish_reason": "stop"}],
-				"usage": {
-					"prompt_tokens": len(conversation.split()),
-					"completion_tokens": len(reply_text.split()),
-					"total_tokens": len(conversation.split()) + len(reply_text.split()),
-				},
-			}
+                data = {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created_time,
+                    "model": request.model,
+                    "choices": [
+                        {"index": 0, "delta": {}, "finish_reason": "stop"}
+                    ],
+                }
+                yield f"data: {json.dumps(data)}\n\n"
+                yield "data: [DONE]\n\n"
 
-			logger.info(f"Returning response: {result}")
-			return result
+            return StreamingResponse(generate_stream(), media_type="text/event-stream")
+        else:
+            result = {
+                "id": completion_id,
+                "object": "chat.completion",
+                "created": created_time,
+                "model": request.model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": reply_text},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 0,  # This is now hard to calculate
+                    "completion_tokens": len(reply_text.split()),
+                    "total_tokens": len(reply_text.split()),
+                },
+            }
+            logger.info(f"Returning response: {result}")
+            return result
 
-	except Exception as e:
-		logger.error(f"Error generating completion: {str(e)}", exc_info=True)
-		raise HTTPException(status_code=500, detail=f"Error generating completion: {str(e)}")
+    except Exception as e:
+        logger.error(f"Error generating completion: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=500, detail=f"Error generating completion: {str(e)}"
+        )
 
 
 @app.get("/")

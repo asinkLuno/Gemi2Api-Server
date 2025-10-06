@@ -4,10 +4,11 @@ services:
   gemini-api:
     build: .
     ports:
-      - "8000:8000"
+      - "8123:8000"
     volumes:
       - ./main.py:/app/main.py
       - ./pyproject.toml:/app/pyproject.toml
+      - ./gemini_db:/app/gemini_db
     env_file:
       - .env
     restart: unless-stopped
